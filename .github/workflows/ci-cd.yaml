@@ -1,0 +1,154 @@
+name: Dictionary CI-CD
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build-and-test-dotnet:
+    name: Build and Unit Test for .NET 8
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: 8.0.x
+    - name: Restore
+      run: dotnet restore
+      working-directory: ./src
+    - name: Build
+      run: dotnet build --no-restore
+      working-directory: ./src
+    - name: Unit Test
+      run: dotnet test --no-build --verbosity normal
+      working-directory: ./src/DictionaryWebApp.UnitTests
+    - name: Publish
+      run: |
+        dotnet publish DictionaryWebApp.csproj -c Release -o ./publish
+      working-directory: ./src/DictionaryWebApp
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: publish
+        path: ./src/DictionaryWebApp/publish
+    - name: Adding Job Summary
+      run: echo '#### Artifact uploaded and unit tests passed :white_check_mark:' >> $GITHUB_STEP_SUMMARY
+
+  provision-azure-resources:
+    name: Provision Azure Resources
+    runs-on: ubuntu-latest
+    needs: build-and-test-dotnet
+    outputs:
+      appServiceName: ${{ steps.provision.outputs.appServiceName }}
+      resourceGroup: ${{ steps.provision.outputs.resourceGroup }}
+      loadTestResource: ${{ steps.provision.outputs.loadTestResource }}
+      subscription: ${{ steps.provision.outputs.subscription }}
+    steps:
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+      - uses: actions/checkout@v4
+      - name: Azure Resources Provisioning
+        id: provision
+        run: |
+          az group create --name Dictionary-${{ github.run_id }} --location eastus
+          az deployment group create --name ${{ github.run_id }} --resource-group Dictionary-${{ github.run_id }} --template-file ./azure.bicep
+          echo "resourceGroup=Dictionary-${{ github.run_id }}" >> "$GITHUB_OUTPUT"
+          webapp=$(az deployment group show --name ${{ github.run_id }} --resource-group Dictionary-${{ github.run_id }} --query properties.outputs.appServiceName.value -o tsv)
+          echo "appServiceName=$webapp" >> "$GITHUB_OUTPUT"
+          loadtest=$(az deployment group show --name ${{ github.run_id }} --resource-group Dictionary-${{ github.run_id }} --query properties.outputs.loadTestingName.value -o tsv)
+          echo "loadTestResource=$loadtest" >> "$GITHUB_OUTPUT"
+          subscription=$(az deployment group show --name ${{ github.run_id }} --resource-group Dictionary-${{ github.run_id }} --query properties.outputs.subscription.value -o tsv)
+          echo "subscription=$subscription" >> "$GITHUB_OUTPUT"
+        working-directory: ./infra
+      - name: Adding Job Summary
+        run: echo '#### Azure Resources Provisioned :white_check_mark:' >> $GITHUB_STEP_SUMMARY
+
+  deploy-to-azure:
+    name: Deploy Web App to Azure
+    runs-on: ubuntu-latest
+    environment:
+      name: Azure Web App
+      url: https://${{ needs.provision-azure-resources.outputs.appServiceName }}.azurewebsites.net
+    needs: provision-azure-resources
+    steps:
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+      - name: Get Publish Profile
+        id: getpublishprofile
+        uses: azure/CLI@v2
+        with:
+          inlineScript: |
+            publishprofile=$(az webapp deployment list-publishing-profiles \
+              --name "${{ needs.provision-azure-resources.outputs.appServiceName }}" \
+              --resource-group "${{ needs.provision-azure-resources.outputs.resourceGroup }}" \
+              --subscription "${{ needs.provision-azure-resources.outputs.subscription }}" \
+              --xml)
+            echo "publishprofile=$publishprofile" >> $GITHUB_OUTPUT
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: publish
+          path: ./publish
+      - name: Deploy Web App
+        uses: azure/webapps-deploy@v3
+        with:
+          app-name: ${{ needs.provision-azure-resources.outputs.appServiceName }}
+          package: ./publish
+          publish-profile: ${{ steps.getpublishprofile.outputs.publishprofile }}
+      - name: Adding Job Summary
+        run: echo '#### Web App Deployed :white_check_mark:' >> $GITHUB_STEP_SUMMARY
+
+  playwright-tests:
+    name: Playwright Test
+    runs-on: ubuntu-latest
+    needs: [deploy-to-azure, provision-azure-resources]
+    steps:
+      - name: Wait for Web App to be ready
+        run: sleep 30
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          jq '.BaseUrl = "https://${{ needs.provision-azure-resources.outputs.appServiceName }}.azurewebsites.net/"' config.json > temp.json && mv temp.json config.json
+          dotnet build
+          pwsh bin/Debug/net8.0/playwright.ps1 install --with-deps
+        working-directory: ./src/DictionaryWebApp.PlaywrightTests
+      - name: Playwright Test
+        run: dotnet test --no-build --verbosity normal
+        working-directory: ./src/DictionaryWebApp.PlaywrightTests
+      - name: Adding Job Summary
+        run: echo '#### Playwright Test Passed :white_check_mark:' >> $GITHUB_STEP_SUMMARY
+
+  load-tests:
+    name: Load Testing
+    runs-on: ubuntu-latest
+    needs: [deploy-to-azure, provision-azure-resources]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Update Load Testing Script
+        run: |
+          sed -i '22s|localhost:32782|${{ needs.provision-azure-resources.outputs.appServiceName }}.azurewebsites.net|' LoadTestingScript.jmx
+        working-directory: ./src
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+      - name: Load Testing
+        uses: azure/load-testing@v1
+        with:
+          loadTestConfigFile: ./src/LoadTestingConfig.yaml
+          loadTestResource: ${{ needs.provision-azure-resources.outputs.loadTestResource }}
+          resourceGroup: ${{ needs.provision-azure-resources.outputs.resourceGroup }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: loadTestResults
+          path: ${{ github.workspace }}/loadTest
+      - name: Adding Job Summary
+        run: echo '#### Load Testing Completed :white_check_mark:' >> $GITHUB_STEP_SUMMARY

@@ -1,0 +1,8 @@
+version: v0.1
+testName: DictionaryLoadTesting
+testPlan: LoadTestingScript.jmx
+description: 'Load Testing Dictionary Test Run'
+engineInstances: 1
+failureCriteria: 
+- avg(response_time_ms) > 5000
+- percentage(error) > 20

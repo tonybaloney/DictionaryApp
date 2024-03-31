@@ -1,0 +1,21 @@
+{
+    "name": "Dictionary Codespace",
+    "image": "mcr.microsoft.com/vscode/devcontainers/universal:latest",
+    "remoteUser": "codespace",
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "ms-dotnettools.csharp",
+                "GitHub.copilot",
+                "Github.copilot-chat",
+                "GitHub.vscode-pull-request-github",
+                "ms-azuretools.vscode-bicep"
+            ]
+        },
+        "codespaces": {
+            "openFiles": [
+                "codespace.md"
+            ]
+        }
+    }    
+}
